@@ -2,7 +2,7 @@
 # teri-briefing — render morning or EOD briefing from cached data.
 set -euo pipefail
 
-TERI_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TERI_REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
 export TERI_REPO_ROOT
 
 source "${TERI_REPO_ROOT}/lib/teri.sh"
