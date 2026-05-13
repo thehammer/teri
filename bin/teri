@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+TERI_HOME_DIR="${TERI_DATA_HOME:-$HOME/.teri}"
+mkdir -p "${TERI_HOME_DIR}/state"
+touch "${TERI_HOME_DIR}/state/active"
+trap 'rm -f "${TERI_HOME_DIR}/state/active"' EXIT
+exec claude --agent teri:teri "$@"

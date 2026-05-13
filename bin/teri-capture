@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# teri-capture — non-interactive sub-agent todo capture entrypoint.
+# Two input modes: JSON on stdin, or flags.
+# Never runs a briefing. Never asks clarifying questions.
+set -euo pipefail
+
+TERI_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export TERI_REPO_ROOT
+
+source "${TERI_REPO_ROOT}/lib/teri.sh"
+source "${TERI_REPO_ROOT}/lib/db.sh"
+
+teri_load_context
+db_init
+db_migrate 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Parse flags (override stdin JSON)
+# ---------------------------------------------------------------------------
+FLAG_TITLE="" FLAG_BODY="" FLAG_PRIORITY="" FLAG_DUE="" FLAG_JIRA_KEY=""
+FLAG_SOURCE_REF="" FLAG_IDEMPOTENCY_KEY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --title)           FLAG_TITLE="$2";           shift 2 ;;
+    --body)            FLAG_BODY="$2";             shift 2 ;;
+    --priority)        FLAG_PRIORITY="$2";         shift 2 ;;
+    --due)             FLAG_DUE="$2";              shift 2 ;;
+    --jira-key)        FLAG_JIRA_KEY="$2";         shift 2 ;;
+    --source-ref)      FLAG_SOURCE_REF="$2";       shift 2 ;;
+    --idempotency-key) FLAG_IDEMPOTENCY_KEY="$2";  shift 2 ;;
+    *) echo "{\"ok\":false,\"error\":\"unknown flag: $1\"}" ; exit 2 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Read JSON from stdin if available (non-interactive or pipe)
+# ---------------------------------------------------------------------------
+title="" body="" priority=3 due="" jira_key="" source_ref="" idempotency_key=""
+
+if [[ ! -t 0 ]]; then
+  json_input="$(cat)"
+  if [[ -n "$json_input" ]]; then
+    title="$(echo "$json_input" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('title',''))" 2>/dev/null || true)"
+    body="$(echo "$json_input" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('body',''))" 2>/dev/null || true)"
+    priority="$(echo "$json_input" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('priority',3))" 2>/dev/null || echo 3)"
+    due="$(echo "$json_input" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('due',''))" 2>/dev/null || true)"
+    jira_key="$(echo "$json_input" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('jira_key',''))" 2>/dev/null || true)"
+    source_ref="$(echo "$json_input" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('source_ref',''))" 2>/dev/null || true)"
+    idempotency_key="$(echo "$json_input" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('idempotency_key',''))" 2>/dev/null || true)"
+  fi
+fi
+
+# Flags override stdin
+[[ -n "$FLAG_TITLE" ]]           && title="$FLAG_TITLE"
+[[ -n "$FLAG_BODY" ]]            && body="$FLAG_BODY"
+[[ -n "$FLAG_PRIORITY" ]]        && priority="$FLAG_PRIORITY"
+[[ -n "$FLAG_DUE" ]]             && due="$FLAG_DUE"
+[[ -n "$FLAG_JIRA_KEY" ]]        && jira_key="$FLAG_JIRA_KEY"
+[[ -n "$FLAG_SOURCE_REF" ]]      && source_ref="$FLAG_SOURCE_REF"
+[[ -n "$FLAG_IDEMPOTENCY_KEY" ]] && idempotency_key="$FLAG_IDEMPOTENCY_KEY"
+
+# ---------------------------------------------------------------------------
+# Validate
+# ---------------------------------------------------------------------------
+if [[ -z "$title" ]]; then
+  echo '{"ok":false,"error":"title required"}'; exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Delegate to teri-todo add
+# ---------------------------------------------------------------------------
+add_args=(--title "$title" --source "sub_agent")
+[[ -n "$body" ]]            && add_args+=(--body "$body")
+[[ -n "$due" ]]             && add_args+=(--due "$due")
+[[ -n "$jira_key" ]]        && add_args+=(--jira "$jira_key")
+[[ -n "$source_ref" ]]      && add_args+=(--source-ref "$source_ref")
+[[ -n "$idempotency_key" ]] && add_args+=(--idempotency-key "$idempotency_key")
+add_args+=(--priority "$priority")
+
+result="$("${TERI_REPO_ROOT}/bin/teri-todo" add "${add_args[@]}")"
+rc=$?
+
+if [[ $rc -ne 0 ]]; then
+  echo "{\"ok\":false,\"error\":\"teri-todo add failed\"}"
+  exit $rc
+fi
+
+# Normalize output to capture contract format
+echo "$result" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+existed = r.get('existed', False)
+out = {
+    'ok': True,
+    'id': r.get('id'),
+    'title': r.get('title',''),
+    'existed': existed,
+    'summary': 'already captured' if existed else 'captured'
+}
+print(json.dumps(out))
+"

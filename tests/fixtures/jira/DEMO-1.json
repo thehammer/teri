@@ -1,0 +1,18 @@
+{
+  "key": "DEMO-1",
+  "fields": {
+    "summary": "Implement widget factory integration",
+    "description": "The widget factory needs to be integrated with the main pipeline. This involves updating the configuration and testing the end-to-end flow.",
+    "status": {
+      "name": "In Progress"
+    },
+    "priority": {
+      "name": "High"
+    },
+    "duedate": null,
+    "assignee": {
+      "displayName": "Demo User",
+      "emailAddress": "demo@example.com"
+    }
+  }
+}

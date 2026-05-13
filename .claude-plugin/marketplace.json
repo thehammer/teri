@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "thehammer-teri",
+  "description": "Teri — calm, terse work secretary for Claude Code",
+  "owner": {
+    "name": "Hammer",
+    "url": "https://github.com/thehammer"
+  },
+  "plugins": [
+    {
+      "name": "teri",
+      "description": "Morning briefings, todo capture, and context surfacing across Jira/calendar/email/Sentry.",
+      "author": {
+        "name": "Hammer",
+        "url": "https://github.com/thehammer"
+      },
+      "source": "./plugins/teri",
+      "version": "0.1.0",
+      "category": "productivity",
+      "tags": ["secretary", "todos", "briefing", "productivity"]
+    }
+  ]
+}

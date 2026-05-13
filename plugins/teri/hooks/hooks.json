@@ -1,0 +1,27 @@
+{
+  "description": "Teri plugin hooks — session start/stop for briefing and sentinel management",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/teri-session-start.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/teri-session-stop.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

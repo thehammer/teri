@@ -1,0 +1,12 @@
+{
+  "name": "teri",
+  "version": "0.1.0",
+  "description": "Calm, terse work secretary: morning briefings, todo capture, and context surfacing across Jira/calendar/email/Sentry.",
+  "author": {
+    "name": "Hammer",
+    "url": "https://github.com/thehammer"
+  },
+  "homepage": "https://github.com/thehammer/teri",
+  "license": "MIT",
+  "keywords": ["secretary", "todos", "briefing", "productivity"]
+}

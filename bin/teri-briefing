@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# teri-briefing — render morning or EOD briefing from cached data.
+set -euo pipefail
+
+TERI_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export TERI_REPO_ROOT
+
+source "${TERI_REPO_ROOT}/lib/teri.sh"
+source "${TERI_REPO_ROOT}/lib/db.sh"
+source "${TERI_REPO_ROOT}/lib/cache.sh"
+
+teri_load_context
+
+# Defaults
+AUTO=0
+FORCE=0
+JSON_MODE=0
+KIND="morning"
+NON_INTERACTIVE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --auto)            AUTO=1;            shift ;;
+    --force)           FORCE=1;           shift ;;
+    --json)            JSON_MODE=1;       shift ;;
+    --kind)            KIND="$2";         shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=1; shift ;;
+    *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Guards (only when --auto)
+# ---------------------------------------------------------------------------
+check_guards() {
+  # 1. Sentinel guard
+  if [[ ! -f "$(teri_home)/state/active" ]]; then
+    exit 0
+  fi
+
+  # 2. Explicit opt-out
+  if [[ "${TERI_NO_BRIEFING:-0}" == "1" ]]; then
+    exit 0
+  fi
+
+  # 3. Sub-agent guard
+  if [[ "${CLAUDE_SUBAGENT:-0}" == "1" ]]; then
+    exit 0
+  fi
+
+  # 4. TTL guard
+  local last_briefing="$(teri_home)/state/last-briefing"
+  local ttl_min="${TERI_BRIEFING_TTL_MIN:-30}"
+  if [[ -f "$last_briefing" ]]; then
+    local mtime; mtime="$(stat -f %m "$last_briefing" 2>/dev/null || echo 0)"
+    local now; now="$(date +%s)"
+    local age_min=$(( (now - mtime) / 60 ))
+    if [[ $age_min -lt $ttl_min ]]; then
+      exit 0
+    fi
+  fi
+
+  # 5. Quiet hours guard
+  local quiet="${TERI_BRIEFING_QUIET_HOURS:-22-06}"
+  local tz="${TERI_TIMEZONE:-America/New_York}"
+  if [[ "$quiet" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then
+    local qstart="${BASH_REMATCH[1]}"
+    local qend="${BASH_REMATCH[2]}"
+    local cur_hour
+    cur_hour="$(TZ="$tz" date +%-H 2>/dev/null || date +%-H)"
+    local in_quiet=0
+    if [[ $qstart -le $qend ]]; then
+      # Same-day range (e.g. 09-17)
+      [[ $cur_hour -ge $qstart && $cur_hour -lt $qend ]] && in_quiet=1
+    else
+      # Overnight range (e.g. 22-06)
+      [[ $cur_hour -ge $qstart || $cur_hour -lt $qend ]] && in_quiet=1
+    fi
+    [[ $in_quiet -eq 1 ]] && exit 0
+  fi
+}
+
+[[ $AUTO -eq 1 && $FORCE -eq 0 ]] && check_guards
+
+# ---------------------------------------------------------------------------
+# Morning briefing
+# ---------------------------------------------------------------------------
+render_morning() {
+  local today; today="$(date +%Y-%m-%d)"
+
+  # 1. Refresh cache (best-effort, 10s timeout)
+  if command -v teri-cache-refresh >/dev/null 2>&1; then
+    timeout 10 teri-cache-refresh all 2>/dev/null || true
+  fi
+
+  # 2. Load cache data
+  local calendar_json email_json jira_json sentry_json
+  calendar_json="$(cache_get calendar today 3600 2>/dev/null || echo '{}')"
+  email_json="$(cache_get email inbox 3600 2>/dev/null || echo '{}')"
+  jira_json="$(cache_get jira _my_issues 3600 2>/dev/null || echo '[]')"
+  sentry_json="$(cache_get sentry recent 3600 2>/dev/null || echo '[]')"
+
+  # 3. Query todos
+  local open_todos overdue_todos
+  open_todos="$(db_query_json "SELECT id, title, priority, due_date, jira_key, status
+                               FROM todos
+                               WHERE status IN ('open','in_progress')
+                                 AND (snoozed_until IS NULL OR snoozed_until <= '$(now_iso)')
+                               ORDER BY priority ASC, due_date ASC NULLS LAST
+                               LIMIT 3;" 2>/dev/null || echo '[]')"
+  overdue_todos="$(db_query_json "SELECT id, title, priority, due_date, jira_key, status
+                                  FROM todos
+                                  WHERE status IN ('open','in_progress')
+                                    AND due_date < '${today}'
+                                    AND (snoozed_until IS NULL OR snoozed_until <= '$(now_iso)')
+                                  ORDER BY due_date ASC;" 2>/dev/null || echo '[]')"
+
+  # 4. Yesterday's EOD payload
+  local yesterday_section=""
+  local last_eod
+  last_eod="$(db_query_json "SELECT payload_json FROM briefings
+                              WHERE kind='eod'
+                              ORDER BY created_at DESC LIMIT 1;" 2>/dev/null || echo '[]')"
+  if [[ "$last_eod" != "[]" && -n "$last_eod" ]]; then
+    local in_progress_titles
+    in_progress_titles="$(echo "$last_eod" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if data and data[0].get('payload_json'):
+    payload = json.loads(data[0]['payload_json']) if isinstance(data[0]['payload_json'], str) else data[0]['payload_json']
+    titles = payload.get('in_progress_titles', [])
+    for t in titles:
+        print('-', t)
+" 2>/dev/null || true)"
+    if [[ -n "$in_progress_titles" ]]; then
+      yesterday_section="### Yesterday
+Yesterday you said you'd finish:
+${in_progress_titles}"
+    fi
+  fi
+
+  # 5. Yesterday's done todos
+  local yesterday; yesterday="$(date -v -1d +%Y-%m-%d 2>/dev/null || date -d yesterday +%Y-%m-%d 2>/dev/null || true)"
+  local yesterday_done=""
+  if [[ -n "$yesterday" ]]; then
+    yesterday_done="$(db_query_json "SELECT title FROM todos
+                                     WHERE status='done'
+                                       AND completed_at >= '${yesterday}T00:00:00Z'
+                                       AND completed_at < '${today}T00:00:00Z';" 2>/dev/null || echo '[]')"
+  fi
+
+  # 6. Render markdown
+  local md=""
+  local ts; ts="$(TZ="${TERI_TIMEZONE:-America/New_York}" date +"%A, %B %-d")"
+  md="## Teri — Morning briefing, ${ts}"$'\n\n'
+
+  # Calendar section
+  md+="### Today"$'\n'
+  local cal_events
+  cal_events="$(echo "$calendar_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+events = data.get('events', []) if isinstance(data, dict) else []
+if not events:
+    print('  (no calendar data)')
+for e in events[:8]:
+    start = e.get('start','?')[:16].replace('T',' ')
+    end = e.get('end','?')[11:16] if e.get('end') else ''
+    subj = e.get('subject', e.get('title', '?'))
+    loc = ' @ ' + e['location'] if e.get('location') else ''
+    print(f'  {start}–{end}  {subj}{loc}')
+" 2>/dev/null || echo "  (calendar unavailable)")"
+  md+="${cal_events}"$'\n\n'
+
+  # On your plate
+  md+="### On your plate"$'\n'
+  local plate_items
+  plate_items="$(python3 -c "
+import json, sys
+
+open_todos = json.loads('''${open_todos}'''.replace(\"'\",\"'\"))
+overdue_todos = json.loads('''${overdue_todos}'''.replace(\"'\",\"'\"))
+
+printed = set()
+# Overdue first
+for t in overdue_todos:
+    tid = t['id']
+    if tid not in printed:
+        due = t.get('due_date','')
+        jira = ' [' + t['jira_key'] + ']' if t.get('jira_key') else ''
+        print(f'  ⚠ [{tid}] {t[\"title\"]}{jira}  due: {due}')
+        printed.add(tid)
+
+# Then top open
+for t in open_todos:
+    tid = t['id']
+    if tid not in printed:
+        due = '  due: ' + t['due_date'] if t.get('due_date') else ''
+        jira = ' [' + t['jira_key'] + ']' if t.get('jira_key') else ''
+        print(f'  [{tid}] p{t[\"priority\"]} {t[\"status\"]}  {t[\"title\"]}{jira}{due}')
+        printed.add(tid)
+
+if not printed:
+    print('  (nothing on your plate)')
+" 2>/dev/null || echo "  (todo data unavailable)")"
+  md+="${plate_items}"$'\n\n'
+
+  # Inbox
+  md+="### Inbox"$'\n'
+  local inbox_items
+  inbox_items="$(echo "$email_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if not data or data == {}:
+    print('  (email cache unavailable)')
+    sys.exit()
+count = data.get('count', 0)
+unread = data.get('unread_count', count)
+top = data.get('top', []) or []
+if top:
+    for e in top[:3]:
+        subj = e.get('subject','(no subject)')
+        frm = e.get('from', e.get('sender',''))
+        print(f'  {subj} — {frm}')
+    if unread > 3:
+        print(f'  ... and {unread - 3} more unread')
+else:
+    print(f'  {unread} unread')
+" 2>/dev/null || echo "  (email unavailable)")"
+  md+="${inbox_items}"$'\n\n'
+
+  # Jira
+  md+="### Jira"$'\n'
+  local jira_items
+  jira_items="$(echo "$jira_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+issues = data if isinstance(data, list) else data.get('issues', [])
+if not issues:
+    print('  (no Jira data)')
+for i in issues[:5]:
+    key = i.get('key','?')
+    summary = i.get('fields', {}).get('summary', i.get('summary','?'))
+    status = i.get('fields', {}).get('status', {}).get('name', '') if isinstance(i.get('fields'), dict) else ''
+    print(f'  {key}  {summary}' + (f'  [{status}]' if status else ''))
+" 2>/dev/null || echo "  (Jira cache unavailable)")"
+  md+="${jira_items}"$'\n\n'
+
+  # Sentry
+  md+="### Sentry"$'\n'
+  local sentry_items
+  sentry_items="$(echo "$sentry_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+issues = data if isinstance(data, list) else data.get('issues', [])
+if not issues:
+    print('  (no Sentry data)')
+count = len(issues)
+print(f'  {count} unresolved issue(s)')
+for i in issues[:3]:
+    title = i.get('title', i.get('culprit','?'))
+    print(f'  - {title}')
+" 2>/dev/null || echo "  (Sentry cache unavailable)")"
+  md+="${sentry_items}"$'\n\n'
+
+  # Yesterday section
+  if [[ -n "$yesterday_done" && "$yesterday_done" != "[]" ]]; then
+    local done_titles
+    done_titles="$(echo "$yesterday_done" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for t in data:
+    print('  ✓', t['title'])
+" 2>/dev/null || true)"
+    if [[ -n "$done_titles" ]]; then
+      md+="### Yesterday"$'\n'
+      md+="${done_titles}"$'\n'
+    fi
+  fi
+  if [[ -n "$yesterday_section" ]]; then
+    md+="${yesterday_section}"$'\n'
+  fi
+
+  echo "$md"
+}
+
+# ---------------------------------------------------------------------------
+# EOD briefing
+# ---------------------------------------------------------------------------
+render_eod() {
+  local today; today="$(date +%Y-%m-%d)"
+
+  local in_progress_todos
+  in_progress_todos="$(db_query_json "SELECT id, title, priority, due_date, jira_key, status
+                                      FROM todos
+                                      WHERE status='in_progress'
+                                         OR (status='open' AND due_date <= '${today}')
+                                      ORDER BY status DESC, priority ASC, due_date ASC;" 2>/dev/null || echo '[]')"
+
+  local md
+  md="### End of day — ${today}"$'\n\n'
+
+  local ip_titles=()
+
+  local in_progress_section
+  in_progress_section="$(echo "$in_progress_todos" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+in_prog = [t for t in data if t['status'] == 'in_progress']
+due_today = [t for t in data if t['status'] == 'open']
+if in_prog:
+    print('In progress:')
+    for t in in_prog:
+        jira = ' (jira: ' + t['jira_key'] + ')' if t.get('jira_key') else ''
+        due = '  due: ' + t['due_date'] if t.get('due_date') else ''
+        print(f'  [{t[\"id\"]}] {t[\"title\"]}{jira}{due}')
+if due_today:
+    print()
+    print('Due today still open:')
+    for t in due_today:
+        print(f'  [{t[\"id\"]}] {t[\"title\"]}')
+if not in_prog and not due_today:
+    print('  (nothing in progress or due today — clean plate)')
+" 2>/dev/null || echo "  (no data)")"
+
+  md+="${in_progress_section}"$'\n'
+
+  # Interactive prompt
+  if [[ $NON_INTERACTIVE -eq 0 && -t 0 && -t 1 ]]; then
+    echo "$md"
+    echo ""
+    echo "For each item, enter: done | snooze <until> | note <text> | skip"
+    echo ""
+
+    while IFS=$'\t' read -r id title status due_date jira_key; do
+      echo -n "[${id}] ${title} > "
+      local answer
+      read -r answer || answer="skip"
+      case "${answer%% *}" in
+        done)  teri-todo status "$id" done >/dev/null ;;
+        snooze)
+          local until_raw="${answer#snooze }"
+          teri-todo snooze "$id" "$until_raw" >/dev/null ;;
+        note)
+          local note_text="${answer#note }"
+          db_exec "INSERT INTO events (todo_id, kind, payload_json, created_at)
+                   VALUES (${id}, 'note', '{\"text\":\"${note_text}\"}', '$(now_iso)');"
+          ;;
+        *) : ;;  # skip
+      esac
+    done < <(db_query "SELECT id, title, status, due_date, jira_key FROM todos
+                        WHERE status='in_progress'
+                           OR (status='open' AND due_date <= '${today}')
+                        ORDER BY status DESC, priority ASC;" 2>/dev/null || true)
+    echo ""
+  fi
+
+  # Collect in_progress titles for payload
+  local ip_titles_json
+  ip_titles_json="$(echo "$in_progress_todos" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+titles = [t['title'] for t in data if t['status'] == 'in_progress']
+print(json.dumps(titles))
+" 2>/dev/null || echo '[]')"
+
+  local payload_json="{\"in_progress_titles\":${ip_titles_json}}"
+  local ts; ts="$(now_iso)"
+
+  db_exec "INSERT INTO briefings (kind, summary_md, payload_json, created_at)
+           VALUES ('eod', '$(sqlite_escape "$md")', '$(sqlite_escape "$payload_json")', '${ts}');"
+  touch "$(teri_home)/state/last-briefing"
+
+  [[ $JSON_MODE -eq 1 ]] && echo "$payload_json" || echo "$md"
+}
+
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+db_init
+db_migrate 2>/dev/null || true
+
+case "$KIND" in
+  morning)
+    md="$(render_morning)"
+
+    # Write briefing row
+    local_ts="$(now_iso)"
+    db_exec "INSERT INTO briefings (kind, summary_md, payload_json, created_at)
+             VALUES ('morning', '$(echo "$md" | sed "s/'/''/g")', '{}', '${local_ts}');" 2>/dev/null || true
+
+    touch "$(teri_home)/state/last-briefing"
+
+    [[ $JSON_MODE -eq 1 ]] && echo '{"kind":"morning","ok":true}' || echo "$md"
+    ;;
+  eod)
+    render_eod
+    ;;
+  manual)
+    render_morning
+    ;;
+  *)
+    echo "error: unknown briefing kind: ${KIND}" >&2; exit 2 ;;
+esac

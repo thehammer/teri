@@ -1,0 +1,540 @@
+#!/usr/bin/env bash
+# teri-todo — persistent todo store CLI
+# macOS-only date parsing in v0.1 (uses date -j -f).
+set -euo pipefail
+
+TERI_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export TERI_REPO_ROOT
+
+source "${TERI_REPO_ROOT}/lib/teri.sh"
+source "${TERI_REPO_ROOT}/lib/db.sh"
+
+teri_load_context
+
+# ---------------------------------------------------------------------------
+# Due-date parser
+# Accepts: ISO date, "today", "tomorrow", "monday".."sunday",
+#          "next week", "next monday".."next sunday", "+Nd" (N days from now)
+# Returns ISO date YYYY-MM-DD on stdout, or exits 2 on failure.
+# macOS only in v0.1.
+# ---------------------------------------------------------------------------
+parse_due() {
+  local raw="$1"
+  local lower
+  lower="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | xargs)"
+
+  # ISO date pass-through
+  if [[ "$lower" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "$lower"
+    return 0
+  fi
+
+  # +Nd
+  if [[ "$lower" =~ ^\+([0-9]+)d$ ]]; then
+    local n="${BASH_REMATCH[1]}"
+    date -v "+${n}d" +"%Y-%m-%d"
+    return 0
+  fi
+
+  case "$lower" in
+    today)     date +"%Y-%m-%d" ; return 0 ;;
+    tomorrow)  date -v +1d +"%Y-%m-%d" ; return 0 ;;
+    "next week") date -v +1w +"%Y-%m-%d" ; return 0 ;;
+  esac
+
+  # Day-of-week targets (this coming or next) — bash 3 compat (no assoc arrays)
+  local next_prefix=0
+  local day_name="$lower"
+
+  if [[ "$lower" == next\ * ]]; then
+    day_name="${lower#next }"
+    next_prefix=1
+  fi
+
+  local target_day=""
+  case "$day_name" in
+    sunday)    target_day=0 ;;
+    monday)    target_day=1 ;;
+    tuesday)   target_day=2 ;;
+    wednesday) target_day=3 ;;
+    thursday)  target_day=4 ;;
+    friday)    target_day=5 ;;
+    saturday)  target_day=6 ;;
+  esac
+
+  if [[ -n "$target_day" ]]; then
+    local today_dow
+    today_dow="$(date +%w)"  # 0=Sun
+    local diff=$(( (target_day - today_dow + 7) % 7 ))
+    [[ $diff -eq 0 ]] && diff=7           # same weekday → next week
+    [[ $next_prefix -eq 1 ]] && diff=$((diff + 7))
+    date -v "+${diff}d" +"%Y-%m-%d"
+    return 0
+  fi
+
+  echo "error: cannot parse due date: ${raw}" >&2
+  exit 2
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+today_date() { date +"%Y-%m-%d"; }
+
+emit_event() {
+  local todo_id="$1"
+  local kind="$2"
+  local payload="${3:-{}}"
+  local ts; ts="$(now_iso)"
+  db_exec "INSERT INTO events (todo_id, kind, payload_json, created_at)
+           VALUES (${todo_id}, '$(sqlite_escape "$kind")', '$(sqlite_escape "$payload")', '${ts}');"
+}
+
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+
+row_to_json() {
+  # Given sqlite3 -tabs -noheader output for a todo row, convert to JSON.
+  # Columns: id title body status priority due_date jira_key source source_ref idempotency_key created_at updated_at completed_at snoozed_until
+  db_query_json "SELECT id, title, body, status, priority, due_date, jira_key,
+                        source, source_ref, idempotency_key,
+                        created_at, updated_at, completed_at, snoozed_until
+                 FROM todos WHERE id = $1;"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_init() {
+  db_init
+  db_migrate
+  echo '{"ok":true,"action":"init"}'
+}
+
+cmd_add() {
+  local title="" body="" priority=3 due_date="" jira_key="" source="user"
+  local source_ref="" idempotency_key=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title)          title="$2";          shift 2 ;;
+      --body)           body="$2";           shift 2 ;;
+      --priority)       priority="$2";       shift 2 ;;
+      --due)            due_date="$2";       shift 2 ;;
+      --jira)           jira_key="$2";       shift 2 ;;
+      --source)         source="$2";         shift 2 ;;
+      --source-ref)     source_ref="$2";     shift 2 ;;
+      --idempotency-key) idempotency_key="$2"; shift 2 ;;
+      *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  if [[ -z "$title" ]]; then
+    echo '{"ok":false,"error":"--title is required"}' ; exit 2
+  fi
+
+  # Parse due date if provided
+  if [[ -n "$due_date" ]]; then
+    due_date="$(parse_due "$due_date")"
+  fi
+
+  # Idempotency check
+  if [[ -n "$idempotency_key" ]]; then
+    local existing
+    existing="$(db_query "SELECT id FROM todos WHERE idempotency_key = '$(sqlite_escape "$idempotency_key")' LIMIT 1;")"
+    if [[ -n "$existing" ]]; then
+      local existing_id="$existing"
+      local row
+      row="$(db_query_json "SELECT id, title, body, status, priority, due_date, jira_key,
+                                    source, source_ref, idempotency_key,
+                                    created_at, updated_at, completed_at, snoozed_until
+                             FROM todos WHERE id = ${existing_id};")"
+      # Inject existed:true into first object
+      row="$(echo "$row" | sed 's/^\[{/[{"existed":true,/')"
+      echo "$row" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if data:
+    r = data[0]
+    r['existed'] = True
+    print(json.dumps(r))
+else:
+    print('{\"ok\":false,\"error\":\"not found\"}')
+"
+      exit 0
+    fi
+  fi
+
+  local ts; ts="$(now_iso)"
+  _null_or_val() { [[ -n "$1" ]] && echo "'$(sqlite_escape "$1")'" || echo "NULL"; }
+
+  local body_v;  body_v="$(_null_or_val "$body")"
+  local due_v;   due_v="$(_null_or_val "$due_date")"
+  local jira_v;  jira_v="$(_null_or_val "$jira_key")"
+  local sref_v;  sref_v="$(_null_or_val "$source_ref")"
+  local ikey_v;  ikey_v="$(_null_or_val "$idempotency_key")"
+
+  # Insert and fetch rowid in a single connection so last_insert_rowid() is valid.
+  local new_id
+  new_id="$(sqlite3 -bail "$(teri_db)" "
+INSERT INTO todos
+  (title, body, status, priority, due_date, jira_key,
+   source, source_ref, idempotency_key, created_at, updated_at)
+VALUES
+  ('$(sqlite_escape "$title")', ${body_v}, 'open', ${priority},
+   ${due_v}, ${jira_v}, '$(sqlite_escape "$source")',
+   ${sref_v}, ${ikey_v}, '${ts}', '${ts}');
+SELECT last_insert_rowid();
+")"
+
+  emit_event "$new_id" "created" "{\"title\":\"$(sqlite_escape "$title")\"}"
+
+  db_query_json "SELECT id, title, status, priority, due_date, jira_key,
+                        source, idempotency_key, created_at
+                 FROM todos WHERE id = ${new_id};" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+if data:
+    r = data[0]
+    r['ok'] = True
+    r['existed'] = False
+    print(json.dumps(r))
+"
+}
+
+cmd_from_jira() {
+  local key="${1:-}"
+  if [[ -z "$key" ]]; then
+    echo '{"ok":false,"error":"usage: teri-todo from-jira <KEY>"}' ; exit 2
+  fi
+
+  local cache_file="${TERI_DATA_HOME:-$HOME/.teri}/cache/jira/${key}.json"
+  local ttl=3600  # 1 hour
+
+  # Refresh if missing or stale
+  if [[ ! -f "$cache_file" ]] || \
+     [[ $(( $(date +%s) - $(stat -f %m "$cache_file" 2>/dev/null || echo 0) )) -gt $ttl ]]; then
+    if command -v teri-cache-refresh >/dev/null 2>&1; then
+      teri-cache-refresh jira "$key" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ ! -f "$cache_file" ]]; then
+    echo '{"ok":false,"error":"cache miss — run teri-cache-refresh jira '"$key"' first"}' ; exit 3
+  fi
+
+  local summary description priority_name due_date_raw
+  summary="$(jq -r '.fields.summary // .summary // "No summary"' "$cache_file")"
+  description="$(jq -r '(.fields.description // .description // "") | if type == "string" then .[:500] else "" end' "$cache_file")"
+
+  # Map Jira priority to 1-5 (1=highest, 5=lowest)
+  priority_name="$(jq -r '.fields.priority.name // .priority // "Medium"' "$cache_file")"
+  local priority=3
+  case "$(echo "$priority_name" | tr '[:upper:]' '[:lower:]')" in
+    highest|blocker) priority=1 ;;
+    high|critical)   priority=2 ;;
+    medium)          priority=3 ;;
+    low)             priority=4 ;;
+    lowest|trivial)  priority=5 ;;
+  esac
+
+  due_date_raw="$(jq -r '.fields.duedate // .duedate // ""' "$cache_file")"
+  local due_arg=()
+  if [[ -n "$due_date_raw" && "$due_date_raw" != "null" ]]; then
+    due_arg=(--due "$due_date_raw")
+  fi
+
+  cmd_add \
+    --title "$summary" \
+    --body "$description" \
+    --priority "$priority" \
+    --jira "$key" \
+    --source "jira" \
+    --idempotency-key "jira:${key}" \
+    ${due_arg[@]+"${due_arg[@]}"}
+}
+
+cmd_list() {
+  local status_filter="open,in_progress"
+  local due_before=""
+  local include_snoozed=0
+  local limit=50
+  local json_mode=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status)          status_filter="$2"; shift 2 ;;
+      --due-before)      due_before="$2";    shift 2 ;;
+      --include-snoozed) include_snoozed=1;  shift ;;
+      --limit)           limit="$2";         shift 2 ;;
+      --json)            json_mode=1;        shift ;;
+      *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  # Build status IN clause
+  local status_in
+  status_in="$(echo "$status_filter" | tr ',' '\n' | awk "{printf \"%s'%s'\", (NR>1?\",\":\"\"), \$1}" | tr -d '\n')"
+
+  local where_clauses=("status IN (${status_in})")
+
+  if [[ $include_snoozed -eq 0 ]]; then
+    where_clauses+=("(snoozed_until IS NULL OR snoozed_until <= '$(now_iso)')")
+  fi
+
+  if [[ -n "$due_before" ]]; then
+    local due_parsed; due_parsed="$(parse_due "$due_before")"
+    where_clauses+=("due_date <= '${due_parsed}'")
+  fi
+
+  local where_sql
+  where_sql=""
+  local clause
+  for clause in "${where_clauses[@]}"; do
+    [[ -n "$where_sql" ]] && where_sql="${where_sql} AND ${clause}" || where_sql="$clause"
+  done
+
+  local sql="SELECT id, title, status, priority, due_date, jira_key, created_at
+             FROM todos
+             WHERE ${where_sql}
+             ORDER BY priority ASC, due_date ASC NULLS LAST, created_at DESC
+             LIMIT ${limit};"
+
+  if [[ $json_mode -eq 1 ]] || [[ ! -t 1 ]]; then
+    db_query_json "$sql"
+  else
+    # Human-readable table
+    printf "%-4s %-3s %-12s %-10s %s\n" "ID" "PRI" "STATUS" "DUE" "TITLE"
+    printf -- "%-4s %-3s %-12s %-10s %s\n" "----" "---" "------------" "----------" "-----"
+    while IFS=$'\t' read -r id title status priority due_date jira_key created_at; do
+      local due_disp="${due_date:-         }"
+      local jira_disp="${jira_key:+ [$jira_key]}"
+      printf "%-4s %-3s %-12s %-10s %s%s\n" "$id" "$priority" "$status" "$due_disp" "$title" "$jira_disp"
+    done < <(db_query "$sql")
+  fi
+}
+
+cmd_show() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { echo "error: usage: teri-todo show <id>" >&2; exit 2; }
+
+  local row
+  row="$(db_query_json "SELECT * FROM todos WHERE id = ${id};")"
+  if [[ "$row" == "[]" ]]; then
+    echo '{"ok":false,"error":"not found"}'; exit 3
+  fi
+
+  echo "$row"
+
+  # Last 10 events
+  db_query_json "SELECT kind, payload_json, created_at FROM events
+                 WHERE todo_id = ${id}
+                 ORDER BY created_at DESC LIMIT 10;"
+
+  # Jira summary from cache if available
+  local jira_key
+  jira_key="$(db_query "SELECT jira_key FROM todos WHERE id = ${id};")"
+  if [[ -n "$jira_key" ]]; then
+    local cache="${TERI_DATA_HOME:-$HOME/.teri}/cache/jira/${jira_key}.json"
+    if [[ -f "$cache" ]]; then
+      local jira_summary
+      jira_summary="$(jq -r '.fields.summary // .summary // ""' "$cache" 2>/dev/null || true)"
+      [[ -n "$jira_summary" ]] && echo "Jira: ${jira_key} — ${jira_summary}"
+    fi
+  fi
+}
+
+cmd_update() {
+  local id="${1:-}"; shift || true
+  [[ -z "$id" ]] && { echo "error: usage: teri-todo update <id> [flags]" >&2; exit 2; }
+
+  local updates=()
+  local title="" body="" priority="" due_date=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title)    title="$2";    shift 2 ;;
+      --body)     body="$2";     shift 2 ;;
+      --priority) priority="$2"; shift 2 ;;
+      --due)      due_date="$2"; shift 2 ;;
+      *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local ts; ts="$(now_iso)"
+  local set_parts=()
+  local diff=()
+
+  [[ -n "$title" ]]    && { set_parts+=("title='$(sqlite_escape "$title")'"); diff+=("title"); }
+  [[ -n "$body" ]]     && { set_parts+=("body='$(sqlite_escape "$body")'");   diff+=("body"); }
+  [[ -n "$priority" ]] && { set_parts+=("priority=${priority}");              diff+=("priority"); }
+  if [[ -n "$due_date" ]]; then
+    local parsed; parsed="$(parse_due "$due_date")"
+    set_parts+=("due_date='${parsed}'")
+    diff+=("due_date")
+  fi
+
+  if [[ ${#set_parts[@]} -eq 0 ]]; then
+    echo '{"ok":false,"error":"no fields to update"}'; exit 2
+  fi
+
+  set_parts+=("updated_at='${ts}'")
+  local set_sql
+  set_sql="$(IFS=", "; echo "${set_parts[*]}")"
+  db_exec "UPDATE todos SET ${set_sql} WHERE id = ${id};"
+
+  local diff_json
+  diff_json="$(printf '%s,' "${diff[@]}" | sed 's/,$//')"
+  emit_event "$id" "updated" "{\"fields\":[${diff_json}]}"
+
+  db_query_json "SELECT id, title, status, priority, due_date, updated_at FROM todos WHERE id = ${id};"
+}
+
+cmd_status() {
+  local id="${1:-}" new_status="${2:-}"
+  [[ -z "$id" || -z "$new_status" ]] && { echo "error: usage: teri-todo status <id> <status>" >&2; exit 2; }
+
+  local valid_statuses="open in_progress done cancelled blocked"
+  if [[ ! " $valid_statuses " =~ " $new_status " ]]; then
+    echo "{\"ok\":false,\"error\":\"invalid status: ${new_status}. Valid: ${valid_statuses}\"}" ; exit 2
+  fi
+
+  local ts; ts="$(now_iso)"
+  local extra_set=""
+  if [[ "$new_status" == "done" || "$new_status" == "cancelled" ]]; then
+    extra_set=", completed_at='${ts}'"
+  fi
+
+  db_exec "UPDATE todos SET status='${new_status}', updated_at='${ts}'${extra_set} WHERE id = ${id};"
+  emit_event "$id" "status_changed" "{\"status\":\"${new_status}\"}"
+
+  db_query_json "SELECT id, title, status, completed_at FROM todos WHERE id = ${id};"
+}
+
+cmd_snooze() {
+  local id="${1:-}" until_raw="${2:-}"
+  [[ -z "$id" || -z "$until_raw" ]] && { echo "error: usage: teri-todo snooze <id> <until>" >&2; exit 2; }
+
+  local until_date; until_date="$(parse_due "$until_raw")"
+  # Convert date to ISO datetime (start of day UTC)
+  local until_iso="${until_date}T00:00:00Z"
+  local ts; ts="$(now_iso)"
+
+  db_exec "UPDATE todos SET snoozed_until='${until_iso}', updated_at='${ts}' WHERE id = ${id};"
+  emit_event "$id" "snoozed" "{\"snoozed_until\":\"${until_iso}\"}"
+
+  db_query_json "SELECT id, title, snoozed_until FROM todos WHERE id = ${id};"
+}
+
+cmd_done() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { echo "error: usage: teri-todo done <id>" >&2; exit 2; }
+  cmd_status "$id" "done"
+}
+
+cmd_search() {
+  local query="${1:-}"
+  [[ -z "$query" ]] && { echo "error: usage: teri-todo search <query>" >&2; exit 2; }
+  shift || true
+
+  local status_filter="open,in_progress,done,cancelled,blocked"
+  local limit=50
+  local json_mode=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status) status_filter="$2"; shift 2 ;;
+      --limit)  limit="$2";         shift 2 ;;
+      --json)   json_mode=1;        shift ;;
+      *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local status_in
+  status_in="$(echo "$status_filter" | tr ',' '\n' | awk "{printf \"%s'%s'\", (NR>1?\",\":\"\"), \$1}" | tr -d '\n')"
+
+  local escaped_q; escaped_q="$(sqlite_escape "$query")"
+  local sql="SELECT id, title, status, priority, due_date, jira_key FROM todos
+             WHERE status IN (${status_in})
+               AND (title LIKE '%${escaped_q}%' OR body LIKE '%${escaped_q}%')
+             ORDER BY priority ASC, due_date ASC NULLS LAST
+             LIMIT ${limit};"
+
+  if [[ $json_mode -eq 1 ]] || [[ ! -t 1 ]]; then
+    db_query_json "$sql"
+  else
+    printf "%-4s %-3s %-12s %-10s %s\n" "ID" "PRI" "STATUS" "DUE" "TITLE"
+    while IFS=$'\t' read -r id title status priority due_date jira_key; do
+      printf "%-4s %-3s %-12s %-10s %s\n" "$id" "$priority" "$status" "${due_date:-}" "$title"
+    done < <(db_query "$sql")
+  fi
+}
+
+cmd_purge() {
+  local older_than="" status_filter="" yes=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --older-than) older_than="$2"; shift 2 ;;
+      --status)     status_filter="$2"; shift 2 ;;
+      --yes)        yes=1; shift ;;
+      *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  if [[ -z "$older_than" || -z "$status_filter" ]]; then
+    echo "error: --older-than and --status are both required for purge" >&2; exit 2
+  fi
+
+  # Parse older-than (e.g. "30d")
+  local days=0
+  if [[ "$older_than" =~ ^([0-9]+)d$ ]]; then
+    days="${BASH_REMATCH[1]}"
+  else
+    echo "error: --older-than must be in Nd format (e.g. 30d)" >&2; exit 2
+  fi
+
+  local cutoff; cutoff="$(date -v "-${days}d" -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+  local status_in
+  status_in="$(echo "$status_filter" | tr ',' '\n' | awk "{printf \"%s'%s'\", (NR>1?\",\":\"\"), \$1}" | tr -d '\n')"
+
+  local count
+  count="$(db_query "SELECT COUNT(*) FROM todos WHERE status IN (${status_in}) AND updated_at < '${cutoff}';")"
+
+  echo "Would purge: ${count} rows"
+
+  if [[ $yes -eq 0 ]]; then
+    echo "Pass --yes to confirm deletion." ; exit 0
+  fi
+
+  db_exec "DELETE FROM todos WHERE status IN (${status_in}) AND updated_at < '${cutoff}';"
+  echo "{\"ok\":true,\"purged\":${count}}"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+CMD="${1:-}"
+shift || true
+
+case "$CMD" in
+  init)       cmd_init "$@" ;;
+  add)        cmd_add "$@" ;;
+  from-jira)  cmd_from_jira "$@" ;;
+  list)       cmd_list "$@" ;;
+  show)       cmd_show "$@" ;;
+  update)     cmd_update "$@" ;;
+  status)     cmd_status "$@" ;;
+  snooze)     cmd_snooze "$@" ;;
+  done)       cmd_done "$@" ;;
+  search)     cmd_search "$@" ;;
+  purge)      cmd_purge "$@" ;;
+  "")
+    echo "Usage: teri-todo <subcommand> [flags]"
+    echo "Subcommands: init add from-jira list show update status snooze done search purge"
+    exit 2 ;;
+  *)
+    echo "error: unknown subcommand: ${CMD}" >&2; exit 2 ;;
+esac
