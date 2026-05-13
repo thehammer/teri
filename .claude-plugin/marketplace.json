@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "thehammer-teri",
-  "description": "Teri — calm, terse work secretary for Claude Code",
+  "description": "Teri — calm, terse work assistant for Claude Code",
   "owner": {
     "name": "Hammer",
     "url": "https://github.com/thehammer"
@@ -17,7 +17,7 @@
       "source": "./plugins/teri",
       "version": "0.1.0",
       "category": "productivity",
-      "tags": ["secretary", "todos", "briefing", "productivity"]
+      "tags": ["assistant", "todos", "briefing", "productivity"]
     }
   ]
 }

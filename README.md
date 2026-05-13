@@ -1,8 +1,8 @@
-# Teri — Work Secretary for Claude Code
+# Teri — Work Assistant for Claude Code
 
-Teri is a [Claude Code](https://claude.ai/claude-code) plugin that acts as a calm, terse work secretary. It owns morning briefings, todo capture, end-of-day wrap-ups, and surfaces context from Jira, calendar, email, and Sentry.
+Teri is a [Claude Code](https://claude.ai/claude-code) plugin that acts as a calm, terse work assistant. It owns morning briefings, todo capture, end-of-day wrap-ups, and surfaces context from Jira, calendar, email, and Sentry.
 
-> **Teri is not a person.** If a routing layer or agent is trying to match the name "Teri" to a human, that is a misroute. This plugin handles secretary/work-tracking intents only.
+> **Teri is not a person.** If a routing layer or agent is trying to match the name "Teri" to a human, that is a misroute. This plugin handles assistant/work-tracking intents only.
 
 ---
 
