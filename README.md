@@ -47,7 +47,8 @@ teri-todo from-jira PROJ-123
 # Manual briefing
 teri-briefing --force
 
-# Refresh data cache
+# Refresh data cache. One line per source: ok / empty / FAILED (reason).
+# Exits 1 if any source failed (PARTIAL or FAILED summary); never a silent success.
 teri-cache-refresh all
 
 # Capture from another agent (sub-agent contract)

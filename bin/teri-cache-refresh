@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # teri-cache-refresh — pull fresh data from global service libs into the Teri cache.
 #
-# Service lib contract (~/.claude/lib/services/<name>.sh):
-#   jira.sh    : jira_fetch_issue <KEY>, jira_fetch_my_issues
-#   m365.sh    : email_fetch_inbox_summary, calendar_fetch_today
-#   sentry.sh  : sentry_fetch_recent_unresolved
+# The global service libs (~/.claude/lib/services/*.sh, read-only) are wrapped by thin
+# adapters in lib/adapters.sh, which print the JSON shapes Teri caches:
+#   jira_fetch_my_issues, jira_fetch_issue KEY, sentry_fetch_recent_unresolved,
+#   calendar_fetch_today, email_fetch_inbox_summary
 #
-# Each function outputs JSON to stdout. Teri caches the result and uses it in briefings.
-# Teri degrades gracefully if any lib is absent or a function is missing.
+# Every source ends in exactly one of three states, printed one line per source:
+#   ok      fetched, N>0 items, cache written
+#   empty   fetched fine, zero items, cache written (a real answer, not an error)
+#   FAILED  could not be fetched (lib/function missing, creds, auth, API, bad JSON,
+#           timeout). Cache is left untouched.
+# Exit: 0 = no source failed; 1 = at least one failed ("PARTIAL" if some succeeded,
+# "FAILED" if none); 2 = usage.
+#
+# Test/override env: TERI_SERVICES_DIR (default ~/.claude/lib/services),
+# TERI_CREDENTIALS_LIB (default ~/.claude/lib/core/credentials.sh),
+# TERI_REFRESH_TIMEOUT (seconds per source, default 30).
 set -euo pipefail
 
 TERI_REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -22,96 +31,136 @@ TTL_OVERRIDE=""
 FORCE=0
 
 # ---------------------------------------------------------------------------
-# Refresh helpers
+# Loading
 # ---------------------------------------------------------------------------
-lib_path() { echo "${HOME}/.claude/lib/services/${1}.sh"; }
+SERVICES_DIR="${TERI_SERVICES_DIR:-${HOME}/.claude/lib/services}"
+CREDENTIALS_LIB="${TERI_CREDENTIALS_LIB:-${HOME}/.claude/lib/core/credentials.sh}"
+SOURCE_TIMEOUT="${TERI_REFRESH_TIMEOUT:-30}"
 
+lib_path() { echo "${SERVICES_DIR}/${1}.sh"; }
 lib_exists() { [[ -f "$(lib_path "$1")" ]]; }
 
-refresh_jira_key() {
-  local key="$1"
-  if ! lib_exists "jira"; then
-    teri_log warn "jira service lib not found — skipping refresh for ${key}"
-    return 0
+# Source credentials (if present), the named service libs, then the Teri adapters.
+# Prints a reason to stderr and returns 1 on any problem. Run inside a per-source subshell.
+load_for() {
+  local name
+  if [[ -f "$CREDENTIALS_LIB" ]]; then
+    # shellcheck disable=SC1090
+    source "$CREDENTIALS_LIB" >/dev/null 2>&1 || true
   fi
-  # shellcheck disable=SC1090
-  source "$(lib_path "jira")" 2>/dev/null || { teri_log warn "failed to source jira.sh"; return 0; }
-  if ! declare -f jira_fetch_issue >/dev/null 2>&1; then
-    teri_log warn "jira_fetch_issue not found in jira.sh — skipping"
-    return 0
+  for name in "$@"; do
+    if ! lib_exists "$name"; then
+      echo "service lib not found: $(lib_path "$name")" >&2
+      return 1
+    fi
+    # shellcheck disable=SC1090
+    source "$(lib_path "$name")" >/dev/null 2>&1 || { echo "failed to source ${name}.sh" >&2; return 1; }
+  done
+  if [[ ! -f "${TERI_REPO_ROOT}/lib/adapters.sh" ]]; then
+    echo "adapters missing: ${TERI_REPO_ROOT}/lib/adapters.sh" >&2
+    return 1
   fi
-  local result
-  result="$(jira_fetch_issue "$key" 2>/dev/null)" || { teri_log warn "jira_fetch_issue ${key} failed"; return 1; }
-  cache_put "jira" "$key" "$result"
-  teri_log info "cache refreshed: jira/${key}"
+  # shellcheck disable=SC1091
+  source "${TERI_REPO_ROOT}/lib/adapters.sh"
 }
 
-refresh_jira_mine() {
-  if ! lib_exists "jira"; then
-    teri_log warn "jira service lib not found — skipping my-issues refresh"
-    return 0
+# ---------------------------------------------------------------------------
+# Refresh: runs in a subshell. Prints "<state>\t<detail>" on stdout; rc 0 for
+# ok/empty, 1 for failed.
+#   refresh_source <libs> <ns> <key> <count-jq> <fn> [args...]
+# ---------------------------------------------------------------------------
+refresh_source() {
+  set +eu
+  local libs="$1" ns="$2" key="$3" count_expr="$4" fn="$5"; shift 5
+  local err_file; err_file="$(mktemp -t teri-refresh-err.XXXXXX)"
+  local reason result count
+
+  fail() { printf 'failed\t%s\n' "$1"; rm -f "$err_file"; return 1; }
+
+  # shellcheck disable=SC2086
+  load_for $libs 2>"$err_file" || { reason="$(head -n1 "$err_file" | cut -c1-200)"; fail "${reason:-load failed}"; return 1; }
+
+  if ! declare -f "$fn" >/dev/null 2>&1; then
+    fail "adapter ${fn} not defined"; return 1
   fi
-  # shellcheck disable=SC1090
-  source "$(lib_path "jira")" 2>/dev/null || { teri_log warn "failed to source jira.sh"; return 0; }
-  if ! declare -f jira_fetch_my_issues >/dev/null 2>&1; then
-    teri_log warn "jira_fetch_my_issues not found in jira.sh — skipping"
-    return 0
+
+  result="$("$fn" "$@" 2>"$err_file")" || {
+    reason="$(head -n1 "$err_file" | cut -c1-200)"
+    fail "${fn}: ${reason:-failed with no message}"; return 1
+  }
+  if ! jq -e . >/dev/null 2>&1 <<<"$result"; then
+    fail "${fn}: returned no valid JSON"; return 1
   fi
-  local result
-  result="$(jira_fetch_my_issues 2>/dev/null)" || { teri_log warn "jira_fetch_my_issues failed"; return 1; }
-  cache_put "jira" "_my_issues" "$result"
-  teri_log info "cache refreshed: jira/_my_issues"
+  count="$(jq -r "$count_expr" <<<"$result" 2>/dev/null)"
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    fail "${fn}: could not count items"; return 1
+  fi
+
+  cache_put "$ns" "$key" "$result"
+  rm -f "$err_file"
+  if [[ "$count" -eq 0 ]]; then
+    printf 'empty\t0 items\n'
+  else
+    printf 'ok\t%s item(s)\n' "$count"
+  fi
 }
 
-refresh_email() {
-  if ! lib_exists "m365"; then
-    teri_log warn "m365 service lib not found — skipping email refresh"
-    return 0
-  fi
-  # shellcheck disable=SC1090
-  source "$(lib_path "m365")" 2>/dev/null || { teri_log warn "failed to source m365.sh"; return 0; }
-  if ! declare -f email_fetch_inbox_summary >/dev/null 2>&1; then
-    teri_log warn "email_fetch_inbox_summary not found in m365.sh — skipping"
-    return 0
-  fi
-  local result
-  result="$(email_fetch_inbox_summary 2>/dev/null)" || { teri_log warn "email_fetch_inbox_summary failed"; return 1; }
-  cache_put "email" "inbox" "$result"
-  teri_log info "cache refreshed: email/inbox"
-}
+refresh_jira_mine() { refresh_source "jira"     jira     _my_issues 'length'          jira_fetch_my_issues; }
+refresh_jira_key()  { refresh_source "jira"     jira     "$1"       'if .key then 1 else 0 end' jira_fetch_issue "$1"; }
+refresh_email()     { refresh_source "m365"     email    inbox      '.count'          email_fetch_inbox_summary; }
+refresh_calendar()  { refresh_source "calendar" calendar today      '.events | length' calendar_fetch_today; }
+refresh_sentry()    { refresh_source "sentry"   sentry   recent     'length'          sentry_fetch_recent_unresolved; }
 
-refresh_calendar() {
-  if ! lib_exists "m365"; then
-    teri_log warn "m365 service lib not found — skipping calendar refresh"
-    return 0
-  fi
-  # shellcheck disable=SC1090
-  source "$(lib_path "m365")" 2>/dev/null || { teri_log warn "failed to source m365.sh"; return 0; }
-  if ! declare -f calendar_fetch_today >/dev/null 2>&1; then
-    teri_log warn "calendar_fetch_today not found in m365.sh — skipping"
-    return 0
-  fi
-  local result
-  result="$(calendar_fetch_today 2>/dev/null)" || { teri_log warn "calendar_fetch_today failed"; return 1; }
-  cache_put "calendar" "today" "$result"
-  teri_log info "cache refreshed: calendar/today"
-}
+# ---------------------------------------------------------------------------
+# Runner: run sources concurrently with a per-source timeout, then report.
+#   run_sources "label:function[:arg]" ...
+# ---------------------------------------------------------------------------
+run_sources() {
+  local dir; dir="$(mktemp -d -t teri-refresh.XXXXXX)"
+  local spec label fn arg pids=() labels=()
+  for spec in "$@"; do
+    label="${spec%%:*}"; fn="${spec#*:}"; arg=""
+    if [[ "$fn" == *:* ]]; then arg="${fn#*:}"; fn="${fn%%:*}"; fi
+    (
+      if [[ -n "$arg" ]]; then "$fn" "$arg"; else "$fn"; fi
+      echo $? > "${dir}/${label}.rc.tmp"; mv "${dir}/${label}.rc.tmp" "${dir}/${label}.rc"
+    ) > "${dir}/${label}.out" 2>/dev/null 3>&- &
+    local pid=$!
+    ( sleep "$SOURCE_TIMEOUT"; pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null ) >/dev/null 2>&1 3>&- &
+    pids+=("$pid"); labels+=("$label")
+    watchdogs+=("$!")
+  done
 
-refresh_sentry() {
-  if ! lib_exists "sentry"; then
-    teri_log warn "sentry service lib not found — skipping sentry refresh"
+  local i n_fail=0 n_good=0 failed_labels="" state detail
+  for i in "${!pids[@]}"; do
+    wait "${pids[$i]}" 2>/dev/null || true
+    pkill -TERM -P "${watchdogs[$i]}" 2>/dev/null || true
+    kill "${watchdogs[$i]}" 2>/dev/null || true
+    label="${labels[$i]}"
+    state=""; detail=""
+    if [[ -f "${dir}/${label}.rc" && -s "${dir}/${label}.out" ]]; then
+      IFS=$'\t' read -r state detail < "${dir}/${label}.out" || true
+    fi
+    case "$state" in
+      ok|empty) n_good=$((n_good + 1)); printf '%-9s %-6s %s\n' "$label" "$state" "$detail" ;;
+      *)
+        n_fail=$((n_fail + 1)); failed_labels+="${failed_labels:+, }${label}"
+        [[ -n "$detail" ]] || detail="no result (timed out after ${SOURCE_TIMEOUT}s or crashed)"
+        printf '%-9s %-6s %s\n' "$label" "FAILED" "$detail"
+        teri_log error "cache refresh ${label} FAILED: ${detail}" ;;
+    esac
+  done
+  rm -rf "$dir"
+
+  if [[ $n_fail -eq 0 ]]; then
+    echo "refresh: all ${n_good} source(s) fetched"
     return 0
+  elif [[ $n_good -eq 0 ]]; then
+    echo "refresh: FAILED (${failed_labels})"
+  else
+    echo "refresh: PARTIAL, ${n_good} fetched, ${n_fail} failed (${failed_labels})"
   fi
-  # shellcheck disable=SC1090
-  source "$(lib_path "sentry")" 2>/dev/null || { teri_log warn "failed to source sentry.sh"; return 0; }
-  if ! declare -f sentry_fetch_recent_unresolved >/dev/null 2>&1; then
-    teri_log warn "sentry_fetch_recent_unresolved not found in sentry.sh — skipping"
-    return 0
-  fi
-  local result
-  result="$(sentry_fetch_recent_unresolved 2>/dev/null)" || { teri_log warn "sentry_fetch_recent_unresolved failed"; return 1; }
-  cache_put "sentry" "recent" "$result"
-  teri_log info "cache refreshed: sentry/recent"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -120,7 +169,6 @@ refresh_sentry() {
 CMD="${1:-all}"
 shift || true
 
-# Parse common flags
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ttl)   TTL_OVERRIDE="$2"; shift 2 ;;
@@ -129,44 +177,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-run_with_timeout() {
-  local timeout=30
-  local func="$1"
-  shift
-  # Use subshell with alarm
-  (
-    # Set a timeout via background kill
-    sleep "$timeout" &
-    local sleep_pid=$!
-    # shellcheck disable=SC2064
-    trap "kill $sleep_pid 2>/dev/null; exit 0" EXIT
-    "$func" "$@"
-    kill "$sleep_pid" 2>/dev/null || true
-  )
-}
+watchdogs=()
 
 case "$CMD" in
   jira)
     if [[ -n "${1:-}" ]]; then
-      refresh_jira_key "$1"
+      run_sources "jira:refresh_jira_key:$1"
     else
-      refresh_jira_mine
+      run_sources "jira:refresh_jira_mine"
     fi ;;
-  email)
-    refresh_email ;;
-  calendar)
-    refresh_calendar ;;
-  sentry)
-    refresh_sentry ;;
+  email)    run_sources "email:refresh_email" ;;
+  calendar) run_sources "calendar:refresh_calendar" ;;
+  sentry)   run_sources "sentry:refresh_sentry" ;;
   all)
-    ok=0
-    run_with_timeout refresh_email      && ok=1 || true &
-    run_with_timeout refresh_calendar   && ok=1 || true &
-    run_with_timeout refresh_sentry     && ok=1 || true &
-    run_with_timeout refresh_jira_mine  && ok=1 || true &
-    wait
-    # Always exit 0 for 'all' — partial success is fine
-    exit 0 ;;
+    run_sources "jira:refresh_jira_mine" "sentry:refresh_sentry" \
+                "calendar:refresh_calendar" "email:refresh_email" ;;
   *)
     echo "Usage: teri-cache-refresh [jira [KEY]|email|calendar|sentry|all] [--ttl N] [--force]" >&2
     exit 2 ;;
