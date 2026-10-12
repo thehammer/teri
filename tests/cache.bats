@@ -67,11 +67,12 @@ teardown() {
   [ ! -d "${TERI_DATA_HOME}/cache/ns1" ]
 }
 
-@test "teri-cache-refresh all: exits 0 with no service libs" {
-  # Use a fresh HOME with no service libs
+@test "teri-cache-refresh all: exits non-zero (not silent success) with no service libs" {
+  # Fresh HOME with no service libs: every source must be reported FAILED.
   local fake_home
   fake_home="$(mktemp -d -t teri-home-XXXXXX)"
   HOME="$fake_home" run --separate-stderr teri-cache-refresh all
   rm -rf "$fake_home"
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"refresh: FAILED"* ]]
 }
